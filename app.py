@@ -39,6 +39,36 @@ APP_SUBTITLE = "Upload a pivot-style CSV/Excel export and diagnose sales, margin
 MONEY_COLS_KEYWORDS = ["sales", "margin", "receipt", "inv", "in-tran", "allocated"]
 BASE_ID_COLS = ["Region", "Store", "Site No", "Volume Band", "Size Band"]
 
+# Store-region lookup used when the SPER Report upload contains store rows but not region labels.
+# Unknown/future stores safely fall back to "Store Detail".
+SITE_REGION_MAP = {
+    "102": "Rocky Mtn", "103": "Rocky Mtn", "104": "Rocky Mtn", "105": "Rocky Mtn", "106": "Rocky Mtn", "108": "Rocky Mtn",
+    "114": "Rocky Mtn", "117": "Southwest", "118": "Rocky Mtn", "119": "Rocky Mtn", "120": "Midwest", "121": "Alaska",
+    "123": "Southwest", "126": "Southwest", "132": "Southwest", "137": "Rocky Mtn", "138": "Rocky Mtn", "139": "Southwest",
+    "145": "Alaska", "148": "Southwest", "149": "California", "152": "Southeast", "155": "Southeast", "158": "Northwest",
+    "159": "Alaska", "163": "Southeast", "176": "California", "177": "Southeast", "178": "Rocky Mtn", "179": "Northwest",
+    "180": "Northeast", "181": "Southwest", "182": "Rocky Mtn", "183": "California", "184": "California", "185": "Northwest",
+    "186": "California", "187": "Southwest", "188": "Rocky Mtn", "189": "Northwest", "190": "Rocky Mtn", "191": "Southeast",
+    "193": "Midwest", "194": "Midwest", "195": "Midwest", "196": "Southeast", "197": "California", "198": "California",
+    "199": "Midwest", "201": "Rocky Mtn", "202": "Rocky Mtn", "203": "Rocky Mtn", "204": "Northwest", "205": "Northwest",
+    "206": "Rocky Mtn", "207": "Northwest", "208": "Northwest", "209": "Northwest", "210": "Northwest", "211": "Southeast",
+    "212": "Alaska", "213": "Northwest", "214": "Rocky Mtn", "215": "Northeast", "216": "Rocky Mtn", "217": "California",
+    "218": "Northwest", "219": "Northeast", "220": "Northeast", "221": "California", "222": "Southwest", "223": "Southeast",
+    "224": "Rocky Mtn", "225": "Southwest", "226": "Rocky Mtn", "227": "Rocky Mtn", "228": "Rocky Mtn", "229": "Southwest",
+    "230": "Northwest", "231": "Northwest", "232": "California", "233": "California", "234": "Rocky Mtn", "235": "Northwest",
+    "236": "Rocky Mtn", "237": "Rocky Mtn", "238": "California", "239": "Southwest", "240": "Rocky Mtn", "241": "Northwest",
+    "242": "Midwest", "243": "Rocky Mtn", "244": "Southwest", "245": "Northwest", "246": "Rocky Mtn", "247": "California",
+    "248": "Alaska", "249": "Northwest", "250": "Southeast", "251": "Southwest", "252": "Southwest", "253": "Southwest",
+    "254": "Rocky Mtn", "255": "Rocky Mtn", "256": "Southeast", "257": "Southwest", "258": "Northeast", "259": "California",
+    "260": "Midwest", "261": "Rocky Mtn", "262": "Rocky Mtn", "263": "Rocky Mtn", "264": "California", "265": "Northeast",
+    "266": "California", "267": "Southeast", "268": "Southeast", "269": "Rocky Mtn", "270": "Northeast", "271": "Southeast",
+    "272": "Southeast", "273": "Northeast", "274": "Northeast", "275": "Northeast", "276": "California", "277": "Rocky Mtn",
+    "278": "Northwest", "279": "Southeast", "280": "Southeast", "281": "Southeast", "282": "Southeast", "283": "Southeast",
+    "284": "Southwest", "287": "Southwest", "400": "Rocky Mtn", "601": "Midwest", "602": "Southeast", "603": "Southeast",
+    "604": "Northeast", "605": "Northeast", "606": "Northeast", "607": "Northeast", "608": "Northeast", "609": "Southeast",
+    "610": "Northeast", "611": "Northeast", "612": "Southeast", "802": "Ecommerce",
+}
+
 
 # -----------------------------
 # Utility functions
@@ -187,6 +217,84 @@ def read_uploaded_file(uploaded_file) -> Tuple[pd.DataFrame, int]:
     return df, header_idx
 
 
+
+
+def is_sper_report_layout(raw: pd.DataFrame) -> bool:
+    """Detect the multi-row SPER report layout rather than the simple pivot export."""
+    sample = " | ".join(raw.head(45).fillna("").astype(str).values.ravel()).lower()
+    return ("sper report" in sample) and ("store no-name" in sample) and ("woc" in sample)
+
+
+def read_sper_report_layout(uploaded_file) -> Tuple[pd.DataFrame, int]:
+    """Parse the SPER report layout with multi-row headers and a store-detail section.
+
+    The report section normally begins with a row containing `Store No-Name`, `#`, and `Size`.
+    Metrics then follow in fixed positions: Sales, STR Inventory, WOC, In Trans, Allocated,
+    Deviation, Avg / Store, % TTL, GM$, GM%, SKU Count, and In-Stock.
+    """
+    name = uploaded_file.name.lower()
+    uploaded_file.seek(0)
+    if name.endswith((".xlsx", ".xls")):
+        raw = pd.read_excel(uploaded_file, header=None, dtype=str)
+    else:
+        raw = pd.read_csv(uploaded_file, header=None, dtype=str)
+
+    store_header_idx = None
+    for idx in range(min(len(raw), 100)):
+        row_txt = " | ".join(raw.iloc[idx].fillna("").astype(str).tolist()).lower()
+        if "store no-name" in row_txt and "size" in row_txt:
+            store_header_idx = idx
+            break
+    if store_header_idx is None:
+        raise ValueError("Could not find the SPER report store-detail header row.")
+
+    store_rows = raw.iloc[store_header_idx + 1 :].copy()
+    # Keep rows that look like store rows: store name in col 1 and numeric site in col 2.
+    if store_rows.shape[1] < 32:
+        raise ValueError("SPER report layout has fewer metric columns than expected.")
+    site = store_rows.iloc[:, 2].astype(str).str.extract(r"(\d+)", expand=False)
+    keep = store_rows.iloc[:, 1].notna() & site.notna()
+    store_rows = store_rows.loc[keep].copy()
+
+    # Fixed-position metric map from the report layout.
+    mapped = pd.DataFrame({
+        "Store": store_rows.iloc[:, 1],
+        "Site No": site.loc[store_rows.index],
+        "Size Band": store_rows.iloc[:, 3].astype(str).str.strip(),
+        "Sales YTD TY": store_rows.iloc[:, 4],
+        "Sales YTD LY": store_rows.iloc[:, 5],
+        "Sales YTD YoY Provided": store_rows.iloc[:, 6],
+        "Inventory LW TY": store_rows.iloc[:, 7],
+        "Inventory LW LY": store_rows.iloc[:, 8],
+        "Inventory YoY Provided": store_rows.iloc[:, 9],
+        "WOC TY": store_rows.iloc[:, 10],
+        "WOC LY": store_rows.iloc[:, 11],
+        "In Transit LW TY": store_rows.iloc[:, 12],
+        "In Transit LW LY": store_rows.iloc[:, 13],
+        "Allocated LW TY": store_rows.iloc[:, 14],
+        "Allocated LW LY": store_rows.iloc[:, 15],
+        "Deviation Sales TY": store_rows.iloc[:, 16],
+        "Deviation Sales LY": store_rows.iloc[:, 17],
+        "Deviation Inventory TY": store_rows.iloc[:, 18],
+        "Deviation Inventory LY": store_rows.iloc[:, 19],
+        "Avg Store Sales TY": store_rows.iloc[:, 20],
+        "Avg Store Sales LY": store_rows.iloc[:, 21],
+        "Avg Store Inventory TY": store_rows.iloc[:, 22],
+        "Avg Store Inventory LY": store_rows.iloc[:, 23],
+        "TTL Sales Mix TY": store_rows.iloc[:, 24],
+        "TTL Inventory Mix TY": store_rows.iloc[:, 25],
+        "Margin YTD TY": store_rows.iloc[:, 26],
+        "Margin YTD LY": store_rows.iloc[:, 27],
+        "GM YTD TY Provided": store_rows.iloc[:, 28],
+        "GM YTD LY Provided": store_rows.iloc[:, 29],
+        "SKU Count": store_rows.iloc[:, 30],
+        "In-Stock Rate Provided": store_rows.iloc[:, 31],
+    })
+    mapped["Region"] = mapped["Site No"].astype(str).map(SITE_REGION_MAP).fillna("Store Detail")
+    mapped["Volume Band"] = ""
+    return mapped, store_header_idx
+
+
 def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [normalize_col(c) for c in df.columns]
@@ -217,11 +325,27 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
         "Sales QTD TY", "Sales QTD LY", "Margin QTD TY", "Margin QTD LY", "Receipt QTD TY", "Receipt QTD LY",
         "Sales YTD TY", "Sales YTD LY", "Margin YTD TY", "Margin YTD LY", "Receipt YTD TY", "Receipt YTD LY",
         "Inventory LW TY", "Inventory LW LY", "In Transit LW TY", "In Transit LW LY",
-        "Allocated LW TY", "Allocated LW LY", "SKU Count", "In-Stock Stores"
+        "Allocated LW TY", "Allocated LW LY", "WOC TY", "WOC LY", "SKU Count", "In-Stock Stores"
     ]
     for c in expected:
         if c not in df.columns:
             df[c] = np.nan
+
+    # SPER report files may provide in-stock rate and GM% directly instead of numerator fields.
+    if "In-Stock Rate Provided" in df.columns:
+        provided_rate = pd.to_numeric(df["In-Stock Rate Provided"], errors="coerce")
+        provided_rate = np.where(provided_rate > 1, provided_rate / 100, provided_rate)
+        df["In-Stock Stores"] = np.where(df["In-Stock Stores"].isna(), provided_rate * df["SKU Count"], df["In-Stock Stores"])
+    if "GM YTD TY Provided" in df.columns:
+        gm_ty = pd.to_numeric(df["GM YTD TY Provided"], errors="coerce")
+        gm_ty = np.where(gm_ty > 1, gm_ty / 100, gm_ty)
+    else:
+        gm_ty = None
+    if "GM YTD LY Provided" in df.columns:
+        gm_ly = pd.to_numeric(df["GM YTD LY Provided"], errors="coerce")
+        gm_ly = np.where(gm_ly > 1, gm_ly / 100, gm_ly)
+    else:
+        gm_ly = None
 
     df["Sales LW YoY"] = yoy(df["Sales LW TY"], df["Sales LW LY"])
     df["Sales QTD YoY"] = yoy(df["Sales QTD TY"], df["Sales QTD LY"])
@@ -238,6 +362,10 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     df["GM LW LY"] = safe_div(df["Margin LW LY"], df["Sales LW LY"])
     df["GM YTD TY"] = safe_div(df["Margin YTD TY"], df["Sales YTD TY"])
     df["GM YTD LY"] = safe_div(df["Margin YTD LY"], df["Sales YTD LY"])
+    if gm_ty is not None:
+        df["GM YTD TY"] = np.where(df["GM YTD TY"].isna(), gm_ty, df["GM YTD TY"])
+    if gm_ly is not None:
+        df["GM YTD LY"] = np.where(df["GM YTD LY"].isna(), gm_ly, df["GM YTD LY"])
     df["GM YTD Change"] = df["GM YTD TY"] - df["GM YTD LY"]
 
     df["In-Stock Rate"] = safe_div(df["In-Stock Stores"], df["SKU Count"])
@@ -250,6 +378,13 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     df["Sales Gap YTD"] = df["Sales YTD TY"] - df["Sales YTD LY"]
     df["Margin Gap YTD"] = df["Margin YTD TY"] - df["Margin YTD LY"]
     df["Momentum Gap"] = df["Sales LW YoY"] - df["Sales YTD YoY"]
+    df["WOC TY"] = pd.to_numeric(df.get("WOC TY", np.nan), errors="coerce")
+    df["WOC LY"] = pd.to_numeric(df.get("WOC LY", np.nan), errors="coerce")
+    df["WOC YoY"] = yoy(df["WOC TY"], df["WOC LY"])
+    df["Coverage Health"] = 1 / (1 + df["WOC TY"].fillna(df["WOC TY"].median(skipna=True)))
+    df["Inbound Supply Pressure"] = safe_div(df["Allocated LW TY"].fillna(0) + df["In Transit LW TY"].fillna(0), df["Inventory LW TY"])
+    df["Lost Sales Proxy"] = (benchmark_placeholder := (0.90 - df["In-Stock Rate"]).clip(lower=0)) * df["Sales YTD TY"].fillna(0)
+
 
     # Advanced scoring. Higher is better for allocation support.
     instock_gap = (0.90 - df["In-Stock Rate"]).clip(lower=0)
@@ -281,6 +416,46 @@ def prepare_data(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["Allocation Risk Score"] = 50.0
 
+    # Inventory Targeting Score: specifically identifies stores where more inventory is most likely to help sales.
+    # This score rewards demand/productivity and shortage pressure, while penalizing high WOC and heavy inbound/allocated supply.
+    target_score_raw = (
+        24 * zscore(winsorize((0.90 - df["In-Stock Rate"]).clip(lower=0)))
+        + 18 * zscore(winsorize(df["Sales YTD YoY"]))
+        + 14 * zscore(winsorize(df["Sales LW YoY"].fillna(df["Sales YTD YoY"])))
+        + 14 * zscore(winsorize(df["Sales per SKU"]))
+        + 10 * zscore(winsorize(df["GM YTD TY"]))
+        + 10 * zscore(winsorize(df["Inventory Productivity"]))
+        + 6 * zscore(winsorize(df["Momentum Gap"]))
+        + 4 * zscore(winsorize(df["Lost Sales Proxy"]))
+        - 16 * zscore(winsorize(df["WOC TY"].fillna(df["WOC TY"].median(skipna=True))))
+        - 12 * zscore(winsorize(df["Inbound Supply Pressure"]))
+        - 10 * zscore(winsorize(df["Inventory/Sales YTD"]))
+        - 8 * zscore(winsorize(df["Allocated/Sales LW"]))
+    )
+    if target_score_raw.notna().sum() > 0 and target_score_raw.max() != target_score_raw.min():
+        df["Inventory Target Score"] = 100 * (target_score_raw - target_score_raw.min()) / (target_score_raw.max() - target_score_raw.min())
+    else:
+        df["Inventory Target Score"] = 50.0
+
+    df["Estimated Support Need $"] = (
+        (0.90 - df["In-Stock Rate"]).clip(lower=0)
+        * df["Sales YTD TY"].fillna(0)
+        * (1 + df["Sales LW YoY"].fillna(0).clip(lower=-0.25, upper=0.35))
+    ).clip(lower=0)
+    df["Inventory Target Reason"] = np.select(
+        [
+            (df["Inventory Target Score"] >= 80),
+            (df["Inventory Target Score"] >= 65),
+            (df["WOC TY"] > 50) | (df["Inventory/Sales YTD"] > 2.1),
+        ],
+        [
+            "High-conviction target: demand/productivity with shortage pressure",
+            "Good target: validate item-level need before sending",
+            "Coverage risk: avoid broad replenishment unless item-level signal is strong",
+        ],
+        default="Monitor"
+    )
+
     conditions = [
         (df["Allocation Priority Score"] >= 75) & (df["Allocation Risk Score"] < 60),
         (df["Allocation Priority Score"] >= 60) & (df["Allocation Risk Score"] < 70),
@@ -311,6 +486,22 @@ def prepare_derived_only(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["Sales LW TY", "Sales LW LY", "Margin LW TY", "Margin LW LY", "Sales YTD TY", "Sales YTD LY", "Margin YTD TY", "Margin YTD LY", "Inventory LW TY", "Inventory LW LY", "Allocated LW TY", "Allocated LW LY", "In Transit LW TY", "In Transit LW LY", "SKU Count", "In-Stock Stores"]:
         if c not in df.columns:
             df[c] = np.nan
+    # SPER report files may provide in-stock rate and GM% directly instead of numerator fields.
+    if "In-Stock Rate Provided" in df.columns:
+        provided_rate = pd.to_numeric(df["In-Stock Rate Provided"], errors="coerce")
+        provided_rate = np.where(provided_rate > 1, provided_rate / 100, provided_rate)
+        df["In-Stock Stores"] = np.where(df["In-Stock Stores"].isna(), provided_rate * df["SKU Count"], df["In-Stock Stores"])
+    if "GM YTD TY Provided" in df.columns:
+        gm_ty = pd.to_numeric(df["GM YTD TY Provided"], errors="coerce")
+        gm_ty = np.where(gm_ty > 1, gm_ty / 100, gm_ty)
+    else:
+        gm_ty = None
+    if "GM YTD LY Provided" in df.columns:
+        gm_ly = pd.to_numeric(df["GM YTD LY Provided"], errors="coerce")
+        gm_ly = np.where(gm_ly > 1, gm_ly / 100, gm_ly)
+    else:
+        gm_ly = None
+
     df["Sales LW YoY"] = yoy(df["Sales LW TY"], df["Sales LW LY"])
     df["Sales YTD YoY"] = yoy(df["Sales YTD TY"], df["Sales YTD LY"])
     df["Margin YTD YoY"] = yoy(df["Margin YTD TY"], df["Margin YTD LY"])
@@ -352,6 +543,43 @@ def plot_bar(df: pd.DataFrame, x: str, y: str, color: Optional[str] = None, titl
     fig.update_layout(height=470, margin=dict(l=10, r=10, t=60, b=10))
     return fig
 
+
+
+
+def add_linear_trendline(fig: go.Figure, df: pd.DataFrame, x: str, y: str, name: str = "Trend line") -> go.Figure:
+    """Add a simple OLS-style linear trendline without requiring statsmodels."""
+    tmp = df[[x, y]].replace([np.inf, -np.inf], np.nan).dropna()
+    if len(tmp) >= 3 and tmp[x].nunique() > 1:
+        xs = pd.to_numeric(tmp[x], errors="coerce")
+        ys = pd.to_numeric(tmp[y], errors="coerce")
+        ok = xs.notna() & ys.notna()
+        xs, ys = xs[ok], ys[ok]
+        if len(xs) >= 3 and xs.nunique() > 1:
+            m, b = np.polyfit(xs, ys, 1)
+            xline = np.linspace(xs.min(), xs.max(), 100)
+            yline = m * xline + b
+            corr = np.corrcoef(xs, ys)[0, 1] if len(xs) > 2 else np.nan
+            fig.add_trace(go.Scatter(
+                x=xline,
+                y=yline,
+                mode="lines",
+                name=f"{name} (r={corr:.2f})" if pd.notna(corr) else name,
+                line=dict(dash="dash", width=3),
+                hovertemplate="Trend x=%{x:.2f}<br>y=%{y:.2f}<extra></extra>",
+            ))
+    return fig
+
+
+def target_badge(score: float) -> str:
+    if pd.isna(score):
+        return "Monitor"
+    if score >= 80:
+        return "Top Inventory Target"
+    if score >= 65:
+        return "Selective Inventory Support"
+    if score <= 35:
+        return "Avoid / Review"
+    return "Monitor"
 
 def make_flags(row: pd.Series) -> str:
     flags = []
@@ -415,7 +643,17 @@ if uploaded is None:
     st.stop()
 
 try:
-    raw_loaded, header_row = read_uploaded_file(uploaded)
+    uploaded.seek(0)
+    if uploaded.name.lower().endswith((".xlsx", ".xls")):
+        raw_probe = pd.read_excel(uploaded, header=None, dtype=str)
+    else:
+        raw_probe = pd.read_csv(uploaded, header=None, dtype=str)
+    uploaded.seek(0)
+    if is_sper_report_layout(raw_probe):
+        raw_loaded, header_row = read_sper_report_layout(uploaded)
+    else:
+        uploaded.seek(0)
+        raw_loaded, header_row = read_uploaded_file(uploaded)
     data = prepare_data(raw_loaded)
 except Exception as e:
     st.error("The file could not be parsed. Check that it is a CSV/Excel export with a pivot header row.")
@@ -479,6 +717,7 @@ tabs = st.tabs([
     "Executive Summary",
     "Regional Diagnostics",
     "Store Leaderboard",
+    "Inventory Targeting",
     "Allocation Engine",
     "Inventory & In-Stock",
     "Margin & Receipts",
@@ -525,11 +764,13 @@ with tabs[1]:
     with c3:
         fig = px.scatter(r, x="Inventory/Sales YTD", y="Sales YTD YoY", size="Sales YTD TY", color="Region", hover_name="Region", title="Region Productivity Map: Inventory Load vs Sales Trend")
         fig.add_hline(y=0, line_dash="dash")
+        add_linear_trendline(fig, r, "Inventory/Sales YTD", "Sales YTD YoY", "Region trend")
         fig.update_layout(height=500)
         st.plotly_chart(fig, use_container_width=True)
     with c4:
         fig = px.scatter(r, x="In-Stock Rate", y="Allocated YoY", size="Allocated LW TY", color="Sales YTD YoY", hover_name="Region", title="Allocation vs In-Stock by Region")
         fig.add_vline(x=benchmark_instock, line_dash="dash")
+        add_linear_trendline(fig, r, "In-Stock Rate", "Allocated YoY", "Region trend")
         fig.update_layout(height=500)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -557,8 +798,140 @@ with tabs[2]:
         worst = f.sort_values("Sales YTD YoY", ascending=True).head(top_n)
         st.dataframe(styled_df(worst[["Region", "Store Label", "Sales YTD TY", "Sales YTD YoY", "Sales LW YoY", "In-Stock Rate", "Inventory/Sales YTD", "Allocation Action"]], currency_cols=["Sales YTD TY"], pct_cols=["Sales YTD YoY", "Sales LW YoY", "In-Stock Rate"], score_cols=["Inventory/Sales YTD"]), use_container_width=True, height=430)
 
-# Allocation Engine
+
+# Inventory Targeting
 with tabs[3]:
+    st.subheader("Inventory Targeting Engine")
+    st.write("This tab isolates the top stores where incremental inventory is most likely to help sales. The score blends shortage pressure, sales trend, last-week momentum, WOC, inventory productivity, sales per SKU, margin rate, and current inbound/allocated supply.")
+
+    candidates = f.copy()
+    # Remove ecommerce-like rows when present and focus on stores with real sales/inventory signal.
+    candidates = candidates[candidates["Sales YTD TY"].fillna(0) > 0].copy()
+    candidates = candidates[~candidates["Store Label"].astype(str).str.contains("ecommerce|e-com|ecom", case=False, na=False)].copy()
+    candidates = candidates[~candidates["Region"].astype(str).str.contains("ecommerce", case=False, na=False)].copy()
+    candidates["Target Tier"] = candidates["Inventory Target Score"].apply(target_badge)
+    top5 = candidates.sort_values("Inventory Target Score", ascending=False).head(5)
+
+    st.markdown("### Top 5 Stores to Target More Inventory")
+    ctop = st.columns(5)
+    for i, (_, row) in enumerate(top5.iterrows()):
+        with ctop[i]:
+            st.metric(
+                f"#{i+1} {row.get('Store Label','')}",
+                f"{row.get('Inventory Target Score', np.nan):.1f}",
+                f"Need {fmt_money(row.get('Estimated Support Need $', np.nan))}",
+                help=row.get("Inventory Target Reason", "")
+            )
+            st.caption(f"In-stock {fmt_pct(row.get('In-Stock Rate', np.nan))} · WOC {row.get('WOC TY', np.nan):.1f} · YTD {fmt_pct(row.get('Sales YTD YoY', np.nan))}")
+
+    top_cols = [
+        "Region", "Store Label", "Size Band", "Inventory Target Score", "Estimated Support Need $",
+        "Sales YTD TY", "Sales YTD YoY", "Sales LW YoY", "Momentum Gap", "GM YTD TY",
+        "In-Stock Rate", "WOC TY", "Inventory/Sales YTD", "Inventory Productivity",
+        "Sales per SKU", "In Transit LW TY", "Allocated LW TY", "Inbound Supply Pressure",
+        "Inventory Target Reason"
+    ]
+    top_cols = [c for c in top_cols if c in candidates.columns]
+    st.dataframe(
+        styled_df(
+            top5[top_cols],
+            currency_cols=["Estimated Support Need $", "Sales YTD TY", "In Transit LW TY", "Allocated LW TY", "Sales per SKU"],
+            pct_cols=["Sales YTD YoY", "Sales LW YoY", "Momentum Gap", "GM YTD TY", "In-Stock Rate", "Inbound Supply Pressure"],
+            score_cols=["Inventory Target Score", "WOC TY", "Inventory/Sales YTD", "Inventory Productivity"],
+        ),
+        use_container_width=True,
+        height=260,
+    )
+
+    st.markdown("### Why These Stores Score Well")
+    reason_parts = []
+    for _, row in top5.iterrows():
+        reason_parts.append(
+            f"**{row.get('Store Label','Store')}**: target score **{row.get('Inventory Target Score', np.nan):.1f}**, "
+            f"in-stock **{fmt_pct(row.get('In-Stock Rate', np.nan))}**, WOC **{row.get('WOC TY', np.nan):.1f}**, "
+            f"YTD sales **{fmt_pct(row.get('Sales YTD YoY', np.nan))}**, LW momentum **{fmt_pct(row.get('Sales LW YoY', np.nan))}**, "
+            f"GM% **{fmt_pct(row.get('GM YTD TY', np.nan))}**."
+        )
+    st.markdown("\n\n".join(reason_parts))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.scatter(
+            candidates,
+            x="In-Stock Rate",
+            y="Sales YTD YoY",
+            size="Sales YTD TY",
+            color="Inventory Target Score",
+            hover_name="Store Label",
+            hover_data=["Size Band", "WOC TY", "Sales LW YoY", "GM YTD TY", "Inventory/Sales YTD", "Allocated LW TY", "Inventory Target Score"],
+            title="Inventory Opportunity Map: In-Stock vs YTD Sales Trend",
+        )
+        fig.add_vline(x=benchmark_instock, line_dash="dash", annotation_text="Target in-stock")
+        fig.add_hline(y=0, line_dash="dash", annotation_text="Flat YoY")
+        add_linear_trendline(fig, candidates, "In-Stock Rate", "Sales YTD YoY", "Store trend")
+        fig.update_layout(height=560)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.scatter(
+            candidates,
+            x="WOC TY",
+            y="Inventory Target Score",
+            size="Estimated Support Need $",
+            color="Sales LW YoY",
+            hover_name="Store Label",
+            hover_data=["In-Stock Rate", "Sales YTD YoY", "Inventory/Sales YTD", "Inbound Supply Pressure", "Allocated LW TY"],
+            title="Target Score vs Weeks of Coverage",
+        )
+        fig.add_vline(x=candidates["WOC TY"].median(skipna=True), line_dash="dash", annotation_text="Median WOC")
+        add_linear_trendline(fig, candidates, "WOC TY", "Inventory Target Score", "Coverage trend")
+        fig.update_layout(height=560)
+        st.plotly_chart(fig, use_container_width=True)
+
+    c3, c4 = st.columns(2)
+    with c3:
+        fig = px.scatter(
+            candidates,
+            x="Inventory Productivity",
+            y="Sales per SKU",
+            size="Sales YTD TY",
+            color="Inventory Target Score",
+            hover_name="Store Label",
+            hover_data=["In-Stock Rate", "WOC TY", "Sales YTD YoY", "GM YTD TY"],
+            title="Productivity View: Sales per Inventory Dollar vs Sales per SKU",
+        )
+        add_linear_trendline(fig, candidates, "Inventory Productivity", "Sales per SKU", "Productivity trend")
+        fig.update_layout(height=540)
+        st.plotly_chart(fig, use_container_width=True)
+    with c4:
+        waterfall = top5.sort_values("Inventory Target Score")
+        fig = px.bar(
+            waterfall,
+            x="Inventory Target Score",
+            y="Store Label",
+            color="Estimated Support Need $",
+            orientation="h",
+            title="Top 5 Inventory Target Scores with Estimated Support Need",
+            hover_data=["In-Stock Rate", "WOC TY", "Sales YTD YoY", "Sales LW YoY", "GM YTD TY"],
+        )
+        fig.update_layout(height=540, yaxis={"categoryorder": "total ascending"})
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("### Full Inventory Targeting Ranking")
+    ranked = candidates.sort_values("Inventory Target Score", ascending=False)[top_cols + (["Target Tier"] if "Target Tier" not in top_cols else [])]
+    st.dataframe(
+        styled_df(
+            ranked,
+            currency_cols=["Estimated Support Need $", "Sales YTD TY", "In Transit LW TY", "Allocated LW TY", "Sales per SKU"],
+            pct_cols=["Sales YTD YoY", "Sales LW YoY", "Momentum Gap", "GM YTD TY", "In-Stock Rate", "Inbound Supply Pressure"],
+            score_cols=["Inventory Target Score", "WOC TY", "Inventory/Sales YTD", "Inventory Productivity"],
+        ),
+        use_container_width=True,
+        height=520,
+    )
+    download_button_for_df(ranked, "Download inventory targeting ranking", "inventory_targeting_ranking.csv")
+
+# Allocation Engine
+with tabs[4]:
     st.subheader("Allocation Engine")
     st.write("The engine scores stores using sales trend, recent momentum, in-stock pressure, inventory load, and margin health. Use the sidebar to tune the custom score.")
 
@@ -582,7 +955,7 @@ with tabs[3]:
     download_button_for_df(rec, "Download allocation recommendations", "allocation_recommendations.csv")
 
 # Inventory & In-Stock
-with tabs[4]:
+with tabs[5]:
     st.subheader("Inventory & In-Stock")
     st.write("Identify understocked winners, inventory-heavy laggards, and stores where allocation may duplicate inbound supply.")
     c1, c2 = st.columns(2)
@@ -590,11 +963,13 @@ with tabs[4]:
         fig = px.scatter(f, x="In-Stock Rate", y="Sales YTD YoY", size="Sales YTD TY", color="Region", hover_name="Store Label", title="In-Stock vs YTD Growth")
         fig.add_vline(x=benchmark_instock, line_dash="dash")
         fig.add_hline(y=0, line_dash="dash")
+        add_linear_trendline(fig, f, "In-Stock Rate", "Sales YTD YoY", "Store trend")
         fig.update_layout(height=520)
         st.plotly_chart(fig, use_container_width=True)
     with c2:
         fig = px.scatter(f, x="Inventory/Sales YTD", y="Sales YTD YoY", size="Inventory LW TY", color="Allocation Action", hover_name="Store Label", title="Inventory Load vs YTD Growth")
         fig.add_hline(y=0, line_dash="dash")
+        add_linear_trendline(fig, f, "Inventory/Sales YTD", "Sales YTD YoY", "Store trend")
         fig.update_layout(height=520)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -609,7 +984,7 @@ with tabs[4]:
         st.dataframe(styled_df(heavy[["Region", "Store Label", "Inventory LW TY", "Sales YTD TY", "Inventory/Sales YTD", "Sales YTD YoY", "Sales LW YoY", "Allocation Risk Score", "Flags"]], currency_cols=["Inventory LW TY", "Sales YTD TY"], pct_cols=["Sales YTD YoY", "Sales LW YoY"], score_cols=["Inventory/Sales YTD", "Allocation Risk Score"]), use_container_width=True, height=420)
 
 # Margin & Receipts
-with tabs[5]:
+with tabs[6]:
     st.subheader("Margin & Receipts")
     st.write("Review whether performance issues are coming from volume, margin rate, receipts, or inventory timing.")
     c1, c2 = st.columns(2)
@@ -617,6 +992,7 @@ with tabs[5]:
         fig = px.scatter(f, x="Sales YTD YoY", y="GM YTD Change", size="Sales YTD TY", color="Region", hover_name="Store Label", title="Sales Growth vs GM Rate Change")
         fig.add_hline(y=0, line_dash="dash")
         fig.add_vline(x=0, line_dash="dash")
+        add_linear_trendline(fig, f, "Sales YTD YoY", "GM YTD Change", "GM trend")
         fig.update_layout(height=520)
         st.plotly_chart(fig, use_container_width=True)
     with c2:
@@ -631,7 +1007,7 @@ with tabs[5]:
     st.dataframe(styled_df(margin_pressure, currency_cols=["Sales YTD TY", "Margin Gap YTD"], pct_cols=["Sales YTD YoY", "GM YTD TY", "GM YTD LY", "GM YTD Change", "Receipt YTD YoY"]), use_container_width=True, height=460)
 
 # Outliers & Clusters
-with tabs[6]:
+with tabs[7]:
     st.subheader("Outliers & Clusters")
     st.write("Cluster stores into operating profiles and detect unusual combinations of growth, inventory, allocation, and in-stock rate.")
     clustered = add_clusters(f, cluster_k)
@@ -667,7 +1043,7 @@ with tabs[6]:
     st.dataframe(styled_df(flagged[["Cluster", "Region", "Store Label", "Sales YTD TY", "Sales YTD YoY", "Sales LW YoY", "In-Stock Rate", "Inventory/Sales YTD", "Allocated/Sales LW", "Allocation Risk Score", "Allocation Action", "Flags"]], currency_cols=["Sales YTD TY"], pct_cols=["Sales YTD YoY", "Sales LW YoY", "In-Stock Rate", "Allocated/Sales LW"], score_cols=["Inventory/Sales YTD", "Allocation Risk Score"]), use_container_width=True, height=480)
 
 # Data Explorer
-with tabs[7]:
+with tabs[8]:
     st.subheader("Data Explorer")
     st.write("Search, filter, download, and inspect the fully enriched dataset.")
     search = st.text_input("Search store, site, region, action, or flags")
@@ -680,7 +1056,7 @@ with tabs[7]:
         explorer = explorer[mask]
 
     default_cols = [
-        "Region", "Store Label", "Site No", "Volume Band", "Size Band", "Sales LW TY", "Sales LW YoY", "Sales YTD TY", "Sales YTD YoY", "Margin YTD TY", "GM YTD TY", "Inventory LW TY", "Inventory YoY", "In Transit LW TY", "Allocated LW TY", "Allocated YoY", "SKU Count", "In-Stock Rate", "Inventory/Sales YTD", "Allocation Priority Score", "Allocation Risk Score", "Custom Allocation Score", "Allocation Action", "Flags"
+        "Region", "Store Label", "Site No", "Volume Band", "Size Band", "Sales LW TY", "Sales LW YoY", "Sales YTD TY", "Sales YTD YoY", "Margin YTD TY", "GM YTD TY", "Inventory LW TY", "Inventory YoY", "In Transit LW TY", "Allocated LW TY", "Allocated YoY", "SKU Count", "In-Stock Rate", "WOC TY", "Inventory/Sales YTD", "Inventory Target Score", "Estimated Support Need $", "Allocation Priority Score", "Allocation Risk Score", "Custom Allocation Score", "Allocation Action", "Flags"
     ]
     available_cols = [c for c in data.columns if c not in default_cols]
     selected_cols = st.multiselect("Columns", default_cols + available_cols, default=[c for c in default_cols if c in explorer.columns])
